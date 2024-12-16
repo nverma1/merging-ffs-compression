@@ -80,3 +80,7 @@ To plot a CKA map from the resulting json file, use the following command:
 ```
 python plot_cka.py --file $output_dir/sims_10000_linear_updated.json --component {attention or ff} --model-name {vit, gpt2, opusmt}
 ```
+### Acknowledgements
+
+#### AI Assistance
+This code was developed with the assistance of OpenAI's ChatGPT, as well as Copilot.
