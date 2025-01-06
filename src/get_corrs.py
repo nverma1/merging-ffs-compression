@@ -1,14 +1,9 @@
 import torch
 import argparse
-import datasets
 import os
 import numpy as np
 
-from torch.utils.data import DataLoader
-from functools import partial
-from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
-from transformers import GPT2Model, GPT2Tokenizer, DataCollatorForLanguageModeling
 
 from utils import (
     cov_to_corr, 
@@ -131,22 +126,7 @@ def finalize_correlations(outdir, max_toks, layer_range=None, reference=None, si
                     breakpoint()
             torch.save(corrs, os.path.join(outdir, f'corrs_{str(max_toks)}_ref_{args.reference}.pt'))
             print('done')
-    
 
-def group_texts(examples, block_size=512):
-    # Concatenate all texts.
-    concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
-    total_length = len(concatenated_examples[list(examples.keys())[0]])
-    # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-    # customize this part to your needs.
-    if total_length >= block_size:
-        total_length = (total_length // block_size) * block_size
-    # Split by chunks of block_size.
-    result = {
-        k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
-        for k, t in concatenated_examples.items()
-    }
-    return result
 
 def add_hooks(model,activations_dict, model_name='vit'):
     def activation_hook(name, side):
@@ -170,15 +150,12 @@ def add_hooks(model,activations_dict, model_name='vit'):
 
 
 
-
 def main(args):
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     model = load_model(args.model_name).to(device)
     tokenizer = load_tokenizer(args.model_name)
-
-    
 
     # Load dataloader
     if args.model_name == 'gpt2-large':
@@ -245,9 +222,7 @@ def main(args):
             else:
                 batch.to(device)
                 _ = model(**batch)
-            # input_ids = batch['input_ids']
-            # attention_mask = batch['attention_mask']
-            # _ = model(input_ids = input_ids, attention_mask=attention_mask)
+
             global outer_prods
             global means
             global total_tokens 
