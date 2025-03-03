@@ -12,7 +12,7 @@ from utils import get_layer_list, load_model, model_param_names
 Computes the merge matrices, based off of the correlation matrices. 
 Includes assigment problem to find the optimal merge.
 '''
-def compute_merge_matrix(correlation_matrices, layer_list, ref_type, reference_only=False):
+def compute_merge_matrix(correlation_matrices, layer_list, ref_type, reference_only=False, sinkhorn=None):
     merges = {}
     costs = None
     if ref_type == 'first':
@@ -46,26 +46,42 @@ Applies "unmerge" matrices as well via transpose.
 '''
 def apply_merges(model, merges, layer_list, layer_idxs, model_type, transpose=False):
     fc1_name = model_param_names[model_type]['fc1']
+    has_gate = False
+    if 'fc1_gate' in model_param_names[model_type]:
+        has_gate = True
+        fc1_gate_name = model_param_names[model_type]['fc1_gate']
     fc2_name = model_param_names[model_type]['fc2']
     for idx, layer in zip(layer_idxs, layer_list):
         merge = merges[int(idx)]
         if transpose == True:
             model[layer + f'{fc1_name}.weight'] = (merge @ model[layer + f'{fc1_name}.weight'].T).T
             model[layer + f'{fc2_name}.weight'] =  (model[layer + f'{fc2_name}.weight'].T @ merge.T).T
+            if has_gate:
+                model[layer + f'{fc1_gate_name}.weight'] = (merge @ model[layer + f'{fc1_gate_name}.weight'].T).T
         else:
             model[layer + f'{fc1_name}.weight'] = merge @ model[layer + f'{fc1_name}.weight']
             model[layer + f'{fc2_name}.weight'] =  model[layer + f'{fc2_name}.weight'] @ merge.T
-        model[layer + f'{fc1_name}.bias'] = merge @ model[layer + f'{fc1_name}.bias']
+            if has_gate:
+                model[layer + f'{fc1_gate_name}.weight'] = merge @ model[layer + f'{fc1_gate_name}.weight']
+        if model_param_names[model_type]['has_bias'] == True:
+            model[layer + f'{fc1_name}.bias'] = merge @ model[layer + f'{fc1_name}.bias']
     return model
 
+def get_ff_weights(model, layer_list, model_type):
+    weights = [f"{model_param_names[model_type]['fc1']}.weight", f"{model_param_names[model_type]['fc2']}.weight"]
+    if 'fc1_gate' in model_param_names[model_type]:
+        weights.append(f"{model_param_names[model_type]['fc1_gate']}.weight")
+    if model_param_names[model_type]['has_bias'] == True:
+        weights.extend([f"{model_param_names[model_type]['fc1']}.bias", f"{model_param_names[model_type]['fc2']}.bias"])
+    return weights
 '''
 After application of merge matrices, FFs are averaged in this step. 
 Replacement of old FFs by merged FF occurs here as well. 
 '''
 def merge_ffs(model, layer_list, model_type):
     # layer_list is a list of dictionaries
-    weights = [f"{model_param_names[model_type]['fc1']}.weight", f"{model_param_names[model_type]['fc2']}.weight"]
-    weights.extend([f"{model_param_names[model_type]['fc1']}.bias", f"{model_param_names[model_type]['fc2']}.bias"])
+    # accommodate SwiGLU
+    weights = get_ff_weights(model, layer_list, model_type)
     # go through weights 
     for weight in weights:
         sum = None
@@ -79,10 +95,10 @@ def merge_ffs(model, layer_list, model_type):
     return model
 
 
-
 def main(args):
     model = load_model(args.model_type)
     model_dict = model.state_dict()
+    starting_param_count = sum([model_dict[key].numel() for key in model_dict.keys()])
 
     if args.encoder_layers != None:
         encoder_layer_idxs = get_layer_list(args.encoder_layers)
@@ -104,12 +120,12 @@ def main(args):
         if args.encoder_layers != None:
             corrs_enc = corrs['enc']
             encoder_layer_idxs = get_layer_list(args.encoder_layers)
-            merge_matrices_enc, _ = compute_merge_matrix(corrs_enc, encoder_layer_idxs, ref_type=args.ref_type, reference_only=args.reference_only)
+            merge_matrices_enc, _ = compute_merge_matrix(corrs_enc, encoder_layer_idxs, ref_type=args.ref_type, reference_only=args.reference_only, sinkhorn=args.sinkhorn)
             model_dict = apply_merges(model_dict, merge_matrices_enc, encoder_layer_list, encoder_layer_idxs, args.model_type, transpose=args.transpose)
         if args.decoder_layers != None: 
             corrs_dec = corrs['dec']
             decoder_layer_idxs = get_layer_list(args.decoder_layers)
-            merge_matrices_dec, _ = compute_merge_matrix(corrs_dec, decoder_layer_idxs, ref_type=args.ref_type,  reference_only=args.reference_only)
+            merge_matrices_dec, _ = compute_merge_matrix(corrs_dec, decoder_layer_idxs, ref_type=args.ref_type,  reference_only=args.reference_only, sinkhorn=args.sinkhorn)
             model_dict = apply_merges(model_dict, merge_matrices_dec, decoder_layer_list, decoder_layer_idxs, args.model_type, transpose=args.transpose)
 
     if args.encoder_layers != None:
@@ -117,8 +133,12 @@ def main(args):
     if args.decoder_layers != None:
         model_dict = merge_ffs(model_dict, decoder_layer_list, args.model_type)
 
-
-    torch.save(model_dict, args.output)
+    end_param_count = sum([model_dict[key].numel() for key in model_dict.keys()])
+    print('ratio of parameters:', end_param_count/starting_param_count)
+    # new
+    model.load_state_dict(model_dict)
+    model.save_pretrained(args.output)
+    # torch.save(model_dict, args.output)
 
 
 
@@ -132,7 +152,7 @@ if __name__ == '__main__':
     parser.add_argument('--ref-type', type=str, required=False, help='Type of reference layer (first, last, mixed)', default='first')
     parser.add_argument('--reference-only', action='store_true', help='Whether the corr dict is just reference based')
     parser.add_argument('--transpose', action='store_true', help='Whether to transpose the weight matrices')
-    
+    parser.add_argument('--sinkhorn', type=float, help='Whether to use Sinkhorn')
 
     args = parser.parse_args()
     main(args)
