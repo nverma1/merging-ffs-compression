@@ -5,6 +5,7 @@ from datasets import load_dataset
 
 from transformers import ViTForImageClassification, ViTImageProcessor
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from transformers import OlmoForCausalLM
 from transformers import MarianMTModel, AutoTokenizer
 from torch.utils.data import DataLoader
 
@@ -18,19 +19,38 @@ model_param_names = {
         'decoder_prefix': None,
         'fc1': 'intermediate.dense',
         'fc2': 'output.dense',
+        'has_bias': True
     },
     'opusmt':{
         'encoder_prefix': 'model.encoder.layers',
         'decoder_prefix': 'model.decoder.layers',
         'fc1': 'fc1',
         'fc2': 'fc2',
+        'has_bias': True
     },
     'gpt2-large':{
         'encoder_prefix': None,
         'decoder_prefix': 'transformer.h',
         'fc1': 'mlp.c_fc',
         'fc2': 'mlp.c_proj',
+        'has_bias': True
     },
+    'olmo':{
+        'encoder_prefix': None,
+        'decoder_prefix': 'model.layers',
+        'fc1': 'mlp.up_proj',
+        'fc1_gate': 'mlp.gate_proj',
+        'fc2': 'mlp.down_proj',
+        'has_bias': False
+    },
+    'olmo1b':{
+        'encoder_prefix': None,
+        'decoder_prefix': 'model.layers',
+        'fc1': 'mlp.up_proj',
+        'fc1_gate': 'mlp.gate_proj',
+        'fc2': 'mlp.down_proj',
+        'has_bias': False
+    }
 }
 
 
@@ -39,6 +59,8 @@ dim_map = {
     'vit': 3072,
     'gpt2-large': 5120,
     'opusmt':2048,
+    'olmo': 11008,
+    'olmo1b': 8192,
 }
 
 
@@ -104,8 +126,9 @@ data helpers
 
 # preprocessing for wikitext
 # original source: https://github.com/huggingface/transformers/blob/main/examples/pytorch/language-modeling/run_clm.py
-def group_texts(examples, block_size=128):
+def group_texts(examples, block_size=512):
     # Concatenate all texts.
+    print(block_size)
     concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
     total_length = len(concatenated_examples[list(examples.keys())[0]])
     # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
@@ -203,6 +226,12 @@ def load_model(model_type):
     elif model_type == 'opusmt':
         model_name = "Helsinki-NLP/opus-mt-zh-en"
         model = MarianMTModel.from_pretrained(model_name)
+    elif model_type == 'olmo':
+        model_name = 'allenai/OLMo-7B-0724-hf'
+        model = OlmoForCausalLM.from_pretrained(model_name)
+    elif model_type == 'olmo1b':
+        model_name = 'allenai/OLMo-1B-0724-hf'
+        model = OlmoForCausalLM.from_pretrained(model_name)
     return model
 
 # loads a tokenizer given a model type
@@ -218,5 +247,11 @@ def load_tokenizer(model_type):
             tokenizer.pad_token = tokenizer.eos_token
     elif model_type == 'opusmt':
         model_name = "Helsinki-NLP/opus-mt-zh-en"
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    elif model_type == 'olmo':
+        model_name = 'allenai/OLMo-7B-0724-hf'
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    elif model_type == 'olmo1b':
+        model_name = 'allenai/OLMo-1B-0724-hf'
         tokenizer = AutoTokenizer.from_pretrained(model_name)
     return tokenizer
