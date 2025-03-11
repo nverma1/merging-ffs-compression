@@ -36,27 +36,30 @@ Key files in src include:
 3. utils.py : utility functions for the above scripts. This file also contains functions for incorporating additional model types.
 4. drop_layers.py: Script to drop layers from a model for our layer-pruning baseline.
 
-#### Getting Correlations:
-
- 
- 
-
-
-
 ## Experiments
 
 ### Obtaining Models  
 
+All models used are available on the Huggingface Hub. Some models and their datasets may require approval via the Huggingface Hub, and a corresponding HF token for access. 
 
 ### Compressing Models
 
+#### Pre-tune
 
+Example experiments for gpt2 and vit are found in ``experiment/main/run_${model}_notune.sh``. Example use is
+```
+run_${model}_notune.sh $outdir $num_toks $start_index $end_index $evaluation_split
+```
 
+#### Tuning
 
+Main tuning scripts coming soon
+
+OLMo's tuning script is found at ``src/olmo/ft_olmo_sum.py`` for the QLoRA extension. 
 
 ### Evaluation
 
-We include a different evaluation script for each model type. For including your own model for evaluation, please add a new script in the ``evaluation/`` directory.
+We include a different evaluation script for each model type. For including your own model for evaluation, please add a new script in the ``src/eval/`` directory.
 
 ```
 # evaluate VIT model
