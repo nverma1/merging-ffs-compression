@@ -1,6 +1,6 @@
 # Merging Feed-Forward Sublayers for Compressed Transformers
 
-This repository contains the code for the paper "Merging Feed-Forward Sublayers for Compressed Transformers". We are actively in the process of updating this repository. 
+This repository contains the code for the paper "Merging Feed-Forward Sublayers for Compressed Transformers". 
 
 ![summary figure](overview.png)
 
