@@ -11,6 +11,8 @@ from torch.utils.data import DataLoader
 
 from transformers import DataCollatorForLanguageModeling
 from transformers import DataCollatorForSeq2Seq
+from functools import partial
+
 
 # this can be updated to accommodate more model types
 model_param_names = {
@@ -67,6 +69,74 @@ dim_map = {
 '''
 layer manipulation helpers
 '''
+import operator
+from functools import reduce
+
+def get_submodule(model, path):
+    """Fetch nested submodule or parameter via dot-separated path."""
+    return reduce(getattr, path.split('.'), model)
+
+def set_submodule(model, path, value):
+    """Set nested submodule or parameter via dot-separated path."""
+    parts = path.split('.')
+    target = reduce(getattr, parts[:-1], model)
+    setattr(target, parts[-1], value)
+
+def tie_weights(model, layers_to_tie, model_type, is_decoder=True):
+    """
+    Tie FFN weights across specified layers using model_param_names.
+    
+    Args:
+        model: The model object.
+        layers_to_tie: List of layer indices to tie.
+        model_type: String key from model_param_names.
+        is_decoder: Whether to use decoder_prefix (True) or encoder_prefix (False).
+    """
+
+    config = model_param_names[model_type]
+    prefix_keys = []
+    if config['decoder_prefix'] is not None:
+        prefix_keys.append(config['decoder_prefix'])
+    if config['encoder_prefix'] is not None:
+        prefix_keys.append(config['encoder_prefix'])
+
+    for prefix in prefix_keys:
+        def build_path(layer_idx, component):
+            if prefix:
+                return f"{prefix}.{layer_idx}.{component}"
+            else:
+                return f"{layer_idx}.{component}"
+
+        reference = layers_to_tie[0]
+        for layer in layers_to_tie:
+            if layer == reference:
+                continue
+            
+            for key in ['fc1', 'fc2']:
+                if key in config:
+                    src_path = build_path(reference, config[key])
+                    tgt_path = build_path(layer, config[key])
+                    set_submodule(model, tgt_path + '.weight', get_submodule(model, src_path + '.weight'))
+                    if config.get('has_bias', False):
+                        set_submodule(model, tgt_path + '.bias', get_submodule(model, src_path + '.bias'))
+
+            # Special case: models like Olmo have fc1 split into gate + up projections
+            if 'fc1_gate' in config:
+                gate_path = config['fc1_gate']
+                src_path = build_path(reference, gate_path)
+                tgt_path = build_path(layer, gate_path)
+                set_submodule(model, tgt_path + '.weight', get_submodule(model, src_path + '.weight'))
+
+def get_all_layers(model, model_name):
+    enc_layers, dec_layers = None, None
+    if model_param_names[model_name]['encoder_prefix'] is not None:
+        enc_layers = get_submodule(model, model_param_names[model_name]['encoder_prefix'] )
+    if model_param_names[model_name]['decoder_prefix'] is not None:
+        dec_layers = get_submodule(model, model_param_names[model_name]['decoder_prefix'] )
+ 
+    layers = [enc_layers, dec_layers]
+
+    return layers
 
 # Retrieve a layer using its dotted path
 def get_layers_by_path(model, layer_name):
@@ -124,11 +194,18 @@ def has_decoder(model_name):
 data helpers
 '''
 
+def get_dataloader(model_type, tokenizer, batch_size, token_string='', seq_len=None):
+    if model_type == 'vit':
+        return load_imagenet(tokenizer, token_string=token_string, batch_size=batch_size)
+    elif model_type == 'gpt2-large':
+        return load_wikitext(tokenizer, batch_size=batch_size, seq_len=seq_len)
+    elif model_type == 'opusmt':
+        return prepare_tatoeba_dataloader(tokenizer, batch_size=batch_size, seq_len=seq_len)
+    
 # preprocessing for wikitext
 # original source: https://github.com/huggingface/transformers/blob/main/examples/pytorch/language-modeling/run_clm.py
 def group_texts(examples, block_size=512):
-    # Concatenate all texts.
-    print(block_size)
+    
     concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
     total_length = len(concatenated_examples[list(examples.keys())[0]])
     # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
@@ -143,7 +220,7 @@ def group_texts(examples, block_size=512):
     return result
         
 # load wikitext dataset
-def load_wikitext(tokenizer, batch_size):
+def load_wikitext(tokenizer, batch_size, seq_len=512):
     wikitext = datasets.load_dataset('wikitext','wikitext-103-raw-v1', split='validation')
     def tokenize_function(examples):
         return tokenizer(examples['text'], return_special_tokens_mask=True)
@@ -152,7 +229,10 @@ def load_wikitext(tokenizer, batch_size):
         batched=True,
         remove_columns=['text'],
     )
-    grouped_wikitext = tokenized_wikitext.map(group_texts, batched=True, num_proc=4)
+    grouped_wikitext = tokenized_wikitext.map(
+        partial(group_texts, block_size=seq_len), 
+        batched=True, 
+        num_proc=4)
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     dataloader = DataLoader(
         grouped_wikitext,
@@ -178,8 +258,11 @@ def load_imagenet(image_processor, token_string='', batch_size=8):
     dataloader = DataLoader(imagenet_valid, batch_size=batch_size, collate_fn=collate_fn)
     return dataloader
 
+def load_olmomix(tokenizer, batch_size):
+    dataset = load_dataset("allenai/olmo-mix-1124", split)
+
 # load tatoeba data, loads zh-en direction
-def prepare_tatoeba_dataloader(tokenizer, batch_size):
+def prepare_tatoeba_dataloader(tokenizer, batch_size, seq_len=None):
     dataset = load_dataset("Helsinki-NLP/tatoeba_mt", "eng-zho", split="validation")
     # we need to flip it around because we are doing zh-en
     def preprocess_function(examples):
@@ -194,9 +277,16 @@ def prepare_tatoeba_dataloader(tokenizer, batch_size):
         model_inputs["labels"] = labels["input_ids"]
         return model_inputs
     tokenized_dataset = dataset.map(preprocess_function, batched=True)
+    if seq_len is not None:
+        tokenized_dataset = tokenized_dataset.filter(
+            lambda ex:  len(ex["input_ids"]) <= seq_len and len(ex["labels"]) <= seq_len
+        )
     tokenized_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels', 'src_length', 'tgt_length']) #
 
-    data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=None)
+    if seq_len is not None:
+        data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=None, max_length=seq_len, padding='max_length')
+    else:
+        data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=None)
 
     dataloader = DataLoader(tokenized_dataset, batch_size=batch_size, collate_fn=data_collator)
     return dataloader
@@ -216,21 +306,27 @@ def cov_to_corr(cov, std1, std2):
 
 # loads a model given a name for it
 # can update this to include more models
-def load_model(model_type):
+def load_model(model_type, model_path=None):
     if model_type == 'vit':
         model_name = 'google/vit-base-patch16-224'
-        model = ViTForImageClassification.from_pretrained(model_name)
+        if model_path:
+            return ViTForImageClassification.from_pretrained(model_path)
+        return ViTForImageClassification.from_pretrained(model_name)
     elif model_type == 'gpt2-large':
         model_name = 'gpt2-large'
-        model = GPT2LMHeadModel.from_pretrained(model_name)
+        if model_path:
+            return GPT2LMHeadModel.from_pretrained(model_path)
+        return GPT2LMHeadModel.from_pretrained(model_name)
     elif model_type == 'opusmt':
         model_name = "Helsinki-NLP/opus-mt-zh-en"
-        model = MarianMTModel.from_pretrained(model_name)
+        if model_path:
+            return MarianMTModel.from_pretrained(model_path)
+        return MarianMTModel.from_pretrained(model_name)
     elif model_type == 'olmo':
         model_name = 'allenai/OLMo-7B-0724-hf'
         model = OlmoForCausalLM.from_pretrained(model_name)
     elif model_type == 'olmo1b':
-        model_name = 'allenai/OLMo-1B-0724-hf'
+        model_name = 'allenai/OLMo-2-0425-1B'
         model = OlmoForCausalLM.from_pretrained(model_name)
     return model
 
@@ -252,6 +348,6 @@ def load_tokenizer(model_type):
         model_name = 'allenai/OLMo-7B-0724-hf'
         tokenizer = AutoTokenizer.from_pretrained(model_name)
     elif model_type == 'olmo1b':
-        model_name = 'allenai/OLMo-1B-0724-hf'
+        model_name = 'allenai/OLMo-2-0425-1B'
         tokenizer = AutoTokenizer.from_pretrained(model_name)
     return tokenizer
