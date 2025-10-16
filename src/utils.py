@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import datasets 
@@ -5,13 +6,14 @@ from datasets import load_dataset
 
 from transformers import ViTForImageClassification, ViTImageProcessor
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
-from transformers import OlmoForCausalLM
+from transformers import OlmoForCausalLM, AutoModelForCausalLM
 from transformers import MarianMTModel, AutoTokenizer
 from torch.utils.data import DataLoader
 
 from transformers import DataCollatorForLanguageModeling
 from transformers import DataCollatorForSeq2Seq
 from functools import partial
+from functools import reduce
 
 
 # this can be updated to accommodate more model types
@@ -65,12 +67,15 @@ dim_map = {
     'olmo1b': 8192,
 }
 
+emb_map = {
+    'vit': 768, 
+    'gpt2-large': 1280,
+    'opusmt': None, #TODO: check this
+    'olmo': None, #TODO: check this     
+    'olmo1b': None, #TODO: check this
+}
 
-'''
-layer manipulation helpers
-'''
-import operator
-from functools import reduce
+
 
 def get_submodule(model, path):
     """Fetch nested submodule or parameter via dot-separated path."""
@@ -258,9 +263,37 @@ def load_imagenet(image_processor, token_string='', batch_size=8):
     dataloader = DataLoader(imagenet_valid, batch_size=batch_size, collate_fn=collate_fn)
     return dataloader
 
-def load_olmomix(tokenizer, batch_size):
-    dataset = load_dataset("allenai/olmo-mix-1124", split)
+def process_dolma(tokenizer, batch_size):
+    # load streaming dataset. This is only 16.4G
+    dolma_dataset = datasets.load_dataset('allenai/dolma', 'v1_6-sample', split='train', trust_remote_code=True)
+    # apply tokenization 
+    # headers =     features: ['id', 'text', 'added', 'created', 'source'],
+    dolma_dataset = dolma_dataset.remove_columns(['id', 'added', 'created', 'source'])
+    def tokenize_function(examples):
+        return tokenizer(examples['text'], return_special_tokens_mask=True)
+    tokenized_dolma = dolma_dataset.map(tokenize_function, batched=True, remove_columns=['text'], num_proc=4)
+    # group texts into blocks of 2048 tokens
+    batched_dataset = tokenized_dolma.map(group_texts, batched=True, batch_size=100)
+    # finish and save and return
+    if not os.path.exists('/exp/nverma/residuals/data/processed_dolma_2048.hf'):
+        batched_dataset.save_to_disk('/exp/nverma/residuals/data/processed_dolma_2048.hf')
+    return batched_dataset
 
+def load_dolma(tokenizer, batch_size):
+    if os.path.exists('/exp/nverma/residuals/data/processed_dolma_2048.hf'):
+        batched_dataset = datasets.load_from_disk('/exp/nverma/residuals/data/processed_dolma_2048.hf')
+    else:
+        batched_dataset = process_dolma(tokenizer, batch_size)
+
+    def collate_fn(batch):
+        input_ids = torch.tensor([x["input_ids"] for x in batch])
+        attention_mask = torch.tensor([x["attention_mask"] for x in batch])
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    
+    dataloader = DataLoader(batched_dataset, batch_size=8, collate_fn=collate_fn)
+    return dataloader
+    
 # load tatoeba data, loads zh-en direction
 def prepare_tatoeba_dataloader(tokenizer, batch_size, seq_len=None):
     dataset = load_dataset("Helsinki-NLP/tatoeba_mt", "eng-zho", split="validation")
@@ -326,8 +359,8 @@ def load_model(model_type, model_path=None):
         model_name = 'allenai/OLMo-7B-0724-hf'
         model = OlmoForCausalLM.from_pretrained(model_name)
     elif model_type == 'olmo1b':
-        model_name = 'allenai/OLMo-2-0425-1B'
-        model = OlmoForCausalLM.from_pretrained(model_name)
+        model_name = 'allenai/OLMo-1B-0724-hf'
+        model = AutoModelForCausalLM.from_pretrained(model_name)
     return model
 
 # loads a tokenizer given a model type
@@ -339,8 +372,6 @@ def load_tokenizer(model_type):
     elif model_type == 'gpt2-large':
         model_name = 'gpt2-large'
         tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
     elif model_type == 'opusmt':
         model_name = "Helsinki-NLP/opus-mt-zh-en"
         tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -348,6 +379,10 @@ def load_tokenizer(model_type):
         model_name = 'allenai/OLMo-7B-0724-hf'
         tokenizer = AutoTokenizer.from_pretrained(model_name)
     elif model_type == 'olmo1b':
-        model_name = 'allenai/OLMo-2-0425-1B'
+        model_name = 'allenai/OLMo-1B-0724-hf'
         tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # olmo and gpt2 models need to have a pad token
+    if 'olmo' in model_name or 'gpt2' in model_name:
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
     return tokenizer

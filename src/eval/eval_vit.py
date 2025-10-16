@@ -40,8 +40,12 @@ def main(args):
     if args.quantize:
         model = load_quantized(args)
     else:
-        model = ViTForImageClassification.from_pretrained(model_name)
-        if not args.baseline:
+        if args.baseline:
+            model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224')
+        elif os.path.isdir(args.model):
+            model = ViTForImageClassification.from_pretrained(args.model)
+        else:
+            model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224')
             state_dict = torch.load(args.model)
             model.load_state_dict(state_dict)
        
