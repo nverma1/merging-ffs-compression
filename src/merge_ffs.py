@@ -11,36 +11,34 @@ Includes assigment problem to find the optimal permutation.
 def compute_permutation_matrix(correlation_matrices, layer_list, ref_type, reference_only=False, scaling=None):
     permutations = {}
     costs = {}
-    if ref_type == 'first':
+    if ref_type == 'first': 
         reference = int(layer_list[0])
     elif ref_type == 'last':
         reference = int(layer_list[-1])
     elif ref_type == 'middle':
-        # if even number of layers, take the lower middle
+        # if even number of layers, take the upper middle
         reference = int(layer_list[len(layer_list)//2])
     
-    scale = None
-    # TODO(neha): if scaling, can make corrs absval since negative scale will be handled by scales
     for i in layer_list:
         if int(i) == reference:
             # do not change the reference layer
             cost = 0
             permutations[int(i)] = torch.eye(correlation_matrices[int(i)][int(i)].shape[0])
         else:
-            if reference_only:
-                corr_mat = correlation_matrices[reference][int(i)]
-                if scaling is not None:
-                    scale = scaling[reference][int(i)]
+            # Use the simpler access pattern from the working version
+            # if int(i) < reference:
+            #     corr_mat = correlation_matrices[reference][int(i)].T
+            #     if scaling is not None:
+            #         scale = scaling[int(i)][reference]
+            #     else:
+            #         scale = None
+            # else:
+            corr_mat = correlation_matrices[reference][int(i)]
+            if scaling is not None:
+                scale = scaling[reference][int(i)]
             else:
-                # here, we need to get the correct corr matrix because only upper triangle is stored
-                if int(i) < reference:
-                    corr_mat = correlation_matrices[int(i)][reference].T
-                    if scaling is not None:
-                        scale = scaling[int(i)][reference]
-                else:
-                    corr_mat = correlation_matrices[reference][int(i)]
-                    if scaling is not None:
-                        scale = scaling[reference][int(i)]
+                scale = None
+            
             dim = corr_mat.shape[0]
             row_ind, col_ind = scipy.optimize.linear_sum_assignment(corr_mat, maximize=True) #reference neuron → neuron in layer i.
             cost = float(corr_mat[row_ind, col_ind].sum()) 
@@ -63,9 +61,10 @@ def apply_permutations(model, permutations, layer_list, layer_idxs, model_type, 
         fc1_gate_name = model_param_names[model_type]['fc1_gate']
     fc2_name = model_param_names[model_type]['fc2']
     for idx, layer in zip(layer_idxs, layer_list):
-        perm = permutations[int(idx)]
+        w_dtype = model[layer + f'{fc1_name}.weight'].dtype
+        perm = permutations[int(idx)].to(w_dtype)
         unperm = torch.where(perm != 0, 1.0 / perm, torch.zeros_like(perm)).T
-        assert torch.allclose(perm @ unperm, torch.eye(perm.shape[0]), atol=1e-5)
+        assert torch.allclose(perm.float() @ unperm.float(), torch.eye(perm.shape[0]), atol=1e-5)
         if transpose == True:
             model[layer + f'{fc1_name}.weight'] = (perm @ model[layer + f'{fc1_name}.weight'].T).T
             model[layer + f'{fc2_name}.weight'] =  (model[layer + f'{fc2_name}.weight'].T @ unperm).T
@@ -114,7 +113,7 @@ def merge_ffs(model, layer_list, model_type, norms=None):
         avg_norm = None
         if norms is not None:
             avg_norm = avg.norm()
-        # replace layers
+        # replace layers - this should be inside the weight loop like the working version
         for layer in layer_list:
             if norms is not None: 
                 prev_norm = norms[layer + weight]
@@ -172,16 +171,15 @@ def main(args):
         model.save_pretrained(args.output)
         return 
 
-    prev_norms = None
-    if args.normalize:
-        if args.encoder_layers != None:
-            prev_norms = get_weight_norms(model_dict, encoder_layer_list, args.model_type)
-        if args.decoder_layers != None:
-            prev_norms = get_weight_norms(model_dict, decoder_layer_list, args.model_type)
-    
     if args.encoder_layers != None: 
+        prev_norms = None
+        if args.normalize:
+            prev_norms = get_weight_norms(model_dict, encoder_layer_list, args.model_type)
         model_dict = merge_ffs(model_dict, encoder_layer_list, args.model_type, norms=prev_norms)
     if args.decoder_layers != None:
+        prev_norms = None
+        if args.normalize:
+            prev_norms = get_weight_norms(model_dict, decoder_layer_list, args.model_type)
         model_dict = merge_ffs(model_dict, decoder_layer_list, args.model_type, norms=prev_norms)
 
     end_param_count = sum([model_dict[key].numel() for key in model_dict.keys()])

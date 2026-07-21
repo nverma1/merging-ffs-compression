@@ -1,0 +1,18 @@
+# OLMo3-7B QLoRA extension (Section 4.5 / 5.5) only.
+# Install in a SEPARATE environment from requirements.txt: OLMo3 support and the
+# trl SFT API used by ft_olmo3.py require transformers>=5, which is incompatible
+# with the transformers==4.45.2 pin used for the main experiments.
+# torch is pinned to the base version; install the CUDA build for your system
+# (these experiments used the cu124 wheels).
+torch==2.5.1
+transformers==5.7.0
+trl==1.3.0
+peft==0.14.0
+bitsandbytes==0.49.2
+accelerate==1.13.0
+datasets==4.8.5
+numpy==1.26.4
+scipy==1.12.0
+rouge-score==0.1.2
+sentencepiece==0.2.1
+tqdm==4.66.4

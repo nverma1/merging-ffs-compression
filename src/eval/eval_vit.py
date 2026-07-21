@@ -62,11 +62,10 @@ def main(args):
     print('Model loaded')
 
     # Load imagenet valid dataset, create dataloader
-    token_string = open(args.hf_token).read().strip()
     if args.split == 'validation':
-        imagenet_eval = load_dataset('ILSVRC/imagenet-1k', split='validation', streaming=True, token=token_string, trust_remote_code=True)
+        imagenet_eval = load_dataset('ILSVRC/imagenet-1k', split='validation', streaming=True, token=args.hf_token, trust_remote_code=True)
     elif args.split == 'test':
-        imagenet_eval = load_dataset('ILSVRC/imagenet-1k', split='test', streaming=True, token=token_string, trust_remote_code=True)
+        imagenet_eval = load_dataset('ILSVRC/imagenet-1k', split='test', streaming=True, token=args.hf_token, trust_remote_code=True)
     
     def collate_fn(batch):
         # Extract images and labels
@@ -111,7 +110,7 @@ if __name__ == '__main__':
     parser.add_argument('--quantize', action='store_true', help='Whether to quantize the model')
     parser.add_argument('--split', default='validation', type=str, help='Dataset split to evaluate on')
     parser.add_argument('--drop-layers', type=str, help='layers to drop')
-    parser.add_argument('--hf-token', type=str)
+    parser.add_argument('--hf-token', type=str, default=os.getenv('HF_TOKEN'))
     
     args = parser.parse_args()
     main(args)

@@ -26,6 +26,16 @@ from utils import (
 
 TOL=1e-5
 
+def remove_pad_ids(activations, lengths):
+    """
+    Remove padding tokens from activations based on sequence lengths.
+    Returns a tensor of shape (sum(lengths), model_dim)
+    """
+    non_padded_tokens = []
+    for i, length in enumerate(lengths):
+        non_padded_tokens.append(activations[i, :length])
+    return torch.cat(non_padded_tokens, dim=0)
+
 class CorrTracker:
     def __init__(
         self, 
@@ -36,6 +46,7 @@ class CorrTracker:
         device='cpu',
         layer_range: list | None = None,
         reference: int | None = None,
+        model_name: str = 'vit',
     ):
         self.dim = dim
         self.sides = sides
@@ -44,10 +55,12 @@ class CorrTracker:
         self.layer_range = layer_range
         self.reference = reference
         self.device = device
+        self.model_name = model_name
 
         self.means = {}
         self.outer_prods = {}
-        self.total_tokens = 0
+        self.enc_total_tokens = 0
+        self.dec_total_tokens = 0
 
         assert (layer_range is not None) or (reference is not None), "Please provide either layer_range or reference"
         assert not (layer_range is not None and reference is not None), "Please provide either layer_range or reference, not both"
@@ -85,16 +98,21 @@ class CorrTracker:
                         self.outer_prods[side][j] = {}
                     self.outer_prods[side][j][j] = torch.zeros(self.dim, self.dim).to(self.device)
     
-    def update(self, activations_dict):
+    def update(self, activations_dict, batch_data=None):
         """
         Updates the means and outer products with activations from a single batch.
         
         Args:
             activations_dict (dict): Dictionary mapping side ('enc'/'dec') -> layer index (str) -> activation tensor.
+            batch_data (dict): Optional batch data containing length information for OpusMT.
         """
         inner_dim = self.dim
         n_layers = {'enc': self.n_enc_layers, 'dec': self.n_dec_layers}
         current_batch_tokens = 0
+        
+        # Handle OpusMT-specific logic
+        if self.model_name == 'opusmt' and batch_data is not None:
+            return self._update_opusmt(activations_dict, batch_data)
         
         for side in self.sides:
             if self.layer_range is not None:
@@ -103,7 +121,9 @@ class CorrTracker:
                     tmp = activations_dict[side][str(i)].reshape(-1, inner_dim).cpu()
                     
                     # only update batch tokens on first side and first layer
-                    if side == self.sides[0] and i == self.layer_range[0]:
+                    if side == 'enc' and i == self.layer_range[0]:
+                        current_batch_tokens = tmp.shape[0]
+                    elif side == 'dec' and i == self.layer_range[0]:
                         current_batch_tokens = tmp.shape[0]
                         
                     self.means[side][i] += tmp.sum(0)
@@ -120,9 +140,10 @@ class CorrTracker:
                     # Get activation for layer i
                     tmp = activations_dict[side][str(i)].reshape(-1, inner_dim).cpu()
                     
-                    if side == self.sides[0] and i == 0:
+                    if i == 0 and side == 'enc':
                         current_batch_tokens = tmp.shape[0]
-                        
+                    elif i == 0 and side == 'dec':
+                        current_batch_tokens = tmp.shape[0]
                     # Update mean for layer i
                     self.means[side][i] += tmp.sum(0)
                     
@@ -132,8 +153,99 @@ class CorrTracker:
                     # get self-product M(i, i)
                     self.outer_prods[side][i][i] += (tmp.T @ tmp)
 
-        self.total_tokens += current_batch_tokens
+            if side == 'enc':
+                self.enc_total_tokens += current_batch_tokens
+            else:
+                self.dec_total_tokens += current_batch_tokens
         return current_batch_tokens
+
+    def _update_opusmt(self, activations_dict, batch_data):
+        """
+        OpusMT-specific update method that handles padding removal and proper token counting.
+        """
+        inner_dim = self.dim
+        n_layers = self.n_enc_layers + self.n_dec_layers
+        
+        # Process all layers in unified manner (like OpusMT-specific version)
+        for i in range(n_layers):
+            # Determine if this is encoder or decoder layer
+            if i < self.n_enc_layers:
+                side = 'enc'
+                layer_key = str(i)
+                lengths = batch_data.get('src_length', None)
+            else:
+                side = 'dec'
+                layer_key = str(i - self.n_enc_layers)
+                lengths = batch_data.get('tgt_length', None)
+            
+            # Get activation tensor
+            if side in activations_dict and layer_key in activations_dict[side]:
+                activation_tensor = activations_dict[side][layer_key]
+            else:
+                continue
+                
+            # Remove padding if lengths are provided
+            if lengths is not None:
+                tmp = remove_pad_ids(activation_tensor, lengths)
+            else:
+                tmp = activation_tensor.reshape(-1, inner_dim)
+            
+            # Move to CPU for storage
+            tmp = tmp.cpu()
+            
+            # Count tokens (only from first layer of each side)
+            if i == 0:
+                self.enc_total_tokens += tmp.shape[0]
+            elif i == self.n_enc_layers:
+                self.dec_total_tokens += tmp.shape[0]
+            
+            # Update means
+            if side not in self.means:
+                self.means[side] = {}
+            if layer_key not in self.means[side]:
+                self.means[side][layer_key] = torch.zeros(inner_dim).to(self.device)
+            self.means[side][layer_key] += tmp.sum(0)
+            
+            # Update outer products
+            if side not in self.outer_prods:
+                self.outer_prods[side] = {}
+            if layer_key not in self.outer_prods[side]:
+                self.outer_prods[side][layer_key] = {}
+            
+            # Compute correlations within encoder or decoder
+            if i < self.n_enc_layers:
+                # Encoder correlations
+                for j in range(i, self.n_enc_layers):
+                    j_layer_key = str(j)
+                    if j_layer_key in activations_dict[side]:
+                        if lengths is not None:
+                            tmp2 = remove_pad_ids(activations_dict[side][j_layer_key], lengths)
+                        else:
+                            tmp2 = activations_dict[side][j_layer_key].reshape(-1, inner_dim)
+                        tmp2 = tmp2.cpu()
+                        
+                        if j_layer_key not in self.outer_prods[side][layer_key]:
+                            self.outer_prods[side][layer_key][j_layer_key] = torch.zeros(inner_dim, inner_dim).to(self.device)
+                        self.outer_prods[side][layer_key][j_layer_key] += (tmp.T @ tmp2)
+            else:
+                # Decoder correlations
+                for j in range(i, n_layers):
+                    j_side = 'dec' if j >= self.n_enc_layers else 'enc'
+                    j_layer_key = str(j - self.n_enc_layers) if j >= self.n_enc_layers else str(j)
+                    j_lengths = batch_data.get('tgt_length', None) if j >= self.n_enc_layers else batch_data.get('src_length', None)
+                    
+                    if j_side in activations_dict and j_layer_key in activations_dict[j_side]:
+                        if j_lengths is not None:
+                            tmp2 = remove_pad_ids(activations_dict[j_side][j_layer_key], j_lengths)
+                        else:
+                            tmp2 = activations_dict[j_side][j_layer_key].reshape(-1, inner_dim)
+                        tmp2 = tmp2.cpu()
+                        
+                        if j_layer_key not in self.outer_prods[side][layer_key]:
+                            self.outer_prods[side][layer_key][j_layer_key] = torch.zeros(inner_dim, inner_dim).to(self.device)
+                        self.outer_prods[side][layer_key][j_layer_key] += (tmp.T @ tmp2)
+        
+        return tmp.shape[0] if 'tmp' in locals() else 0
 
 
     def finalize_correlations(
@@ -160,13 +272,14 @@ class CorrTracker:
             stds[side] = {}
             covs[side] = {}
             scales[side] = {}
+            total_tokens_local = self.enc_total_tokens if side == 'enc' else self.dec_total_tokens
             # --- 1. Compute means --- 
             if self.layer_range is not None:
                 for j in self.layer_range:
-                    self.means[side][j] = self.means[side][j].div(self.total_tokens)
+                    self.means[side][j] = self.means[side][j].div(total_tokens_local)
             elif self.reference is not None:
                 for j in self.means[side]:
-                    self.means[side][j] = self.means[side][j].div(self.total_tokens)
+                    self.means[side][j] = self.means[side][j].div(total_tokens_local)
 
             # --- 2. Compute scaling (if requested) ---
             if scaling:
@@ -176,26 +289,26 @@ class CorrTracker:
                         for k in range(j, self.layer_range[-1]+1):
                             scales[side][j][k] = self.outer_prods[side][j][k] / (self.outer_prods[side][k][k].diag() + 1e-10)
                             scales[side][j][k] = torch.where(scales[side][j][k] < 0, torch.ones_like(scales[side][j][k]), scales[side][j][k])
-                    torch.save(scales, os.path.join(outdir, f'scales_{str(self.total_tokens)}_{range_str}.pt'))
+                    torch.save(scales, os.path.join(outdir, f'scales_{str(total_tokens_local)}_{range_str}.pt'))
                 elif self.reference is not None:
                     scales[side][self.reference] = {}
                     for j in self.outer_prods[side][self.reference]:
                         scales[side][self.reference][j] = self.outer_prods[side][self.reference][j] / (self.outer_prods[side][j][j].diag() + 1e-10)
-                    torch.save(scales, os.path.join(outdir, f'scales_{str(self.total_tokens)}_{ref_str}.pt'))
+                        torch.save(scales, os.path.join(outdir, f'scales_{str(total_tokens_local)}_{ref_str}.pt'))
                     
             # --- 3. Compute covariances ---
             if self.layer_range is not None:
                 for j in self.layer_range:
                     covs[side][j] = {}
                     for k in range(j, self.layer_range[-1]+1):
-                        self.outer_prods[side][j][k] = self.outer_prods[side][j][k].div(self.total_tokens)
+                        self.outer_prods[side][j][k] = self.outer_prods[side][j][k].div(total_tokens_local)
                         cov = self.outer_prods[side][j][k] - torch.outer(self.means[side][j], self.means[side][k])
                         covs[side][j][k] = cov
             elif self.reference is not None:
                 covs[side][self.reference] = {}
                 # Cross-covariances Cov(ref, j)
                 for j in self.outer_prods[side][self.reference]: 
-                    self.outer_prods[side][self.reference][j] = self.outer_prods[side][self.reference][j].div(self.total_tokens)
+                    self.outer_prods[side][self.reference][j] = self.outer_prods[side][self.reference][j].div(total_tokens_local)
                     cov = self.outer_prods[side][self.reference][j] - torch.outer(self.means[side][self.reference], self.means[side][j])
                     covs[side][self.reference][j] = cov
                 
@@ -204,7 +317,7 @@ class CorrTracker:
                     if j != self.reference:
                         if j not in covs[side]:
                             covs[side][j] = {}
-                        self.outer_prods[side][j][j] = self.outer_prods[side][j][j].div(self.total_tokens)
+                        self.outer_prods[side][j][j] = self.outer_prods[side][j][j].div(total_tokens_local)
                         cov = self.outer_prods[side][j][j] - torch.outer(self.means[side][j], self.means[side][j])
                         covs[side][j][j] = cov
                         
@@ -240,12 +353,34 @@ class CorrTracker:
                         assert np.all(np.abs(corrs[side][self.reference][j]) < 1 + TOL)
                     except AssertionError:  
                         breakpoint()
-        if self.layer_range is not None:
-            torch.save(corrs, os.path.join(outdir, f'corrs_{str(self.total_tokens)}_{range_str}_post_{post_act}.pt'))
-            print('done')
+        # Handle OpusMT-specific output format
+        if self.model_name == 'opusmt':
+            # Reorganize output to match OpusMT-specific format
+            corrs_new = {'enc': {}, 'dec': {}}
+            for side in self.sides:
+                if side in corrs:
+                    for layer_key, layer_corrs in corrs[side].items():
+                        if side == 'enc':
+                            corrs_new['enc'][int(layer_key)] = layer_corrs
+                        else:  # decoder
+                            # Convert decoder layer indices to 0-based
+                            dec_layer_idx = int(layer_key)
+                            if dec_layer_idx not in corrs_new['dec']:
+                                corrs_new['dec'][dec_layer_idx] = {}
+                            for j_key, j_corrs in layer_corrs.items():
+                                j_dec_idx = int(j_key)
+                                corrs_new['dec'][dec_layer_idx][j_dec_idx] = j_corrs
+            
+            if self.layer_range is not None:
+                torch.save(corrs_new, os.path.join(outdir, f'corrs_{str(self.enc_total_tokens)}_{str(self.dec_total_tokens)}_{range_str}_post_{post_act}.pt'))
+            else:
+                torch.save(corrs_new, os.path.join(outdir, f'corrs_{str(self.enc_total_tokens)}_{str(self.dec_total_tokens)}_{ref_str}_post_{post_act}.pt'))
         else:
-            torch.save(corrs, os.path.join(outdir, f'corrs_{str(self.total_tokens)}_{ref_str}_post_{post_act}.pt'))
-            print('done')
+            if self.layer_range is not None:
+                torch.save(corrs, os.path.join(outdir, f'corrs_{str(self.enc_total_tokens)}_{str(self.dec_total_tokens)}_{range_str}_post_{post_act}.pt'))
+            else:
+                torch.save(corrs, os.path.join(outdir, f'corrs_{str(self.enc_total_tokens)}_{str(self.dec_total_tokens)}_{ref_str}_post_{post_act}.pt'))
+        print('done')
 
 """
 Given an empty activations dict, add_hooks will populate it with activations during forward passes
@@ -293,20 +428,40 @@ def add_pre_hooks_fc2(model, activations_dict, model_name='vit'):
                 target = getattr(target, part)
             target.register_forward_pre_hook(activation_hook(f'{i}', 'dec'))
 
+def add_attn_hooks(model, activations_dict, model_name='vit'):
+    def activation_hook(name, side):
+        def hook(model, input, output):
+            activations_dict[side][name] = output.to(dtype=torch.float32)
+        return hook
+    if has_encoder(model_name):
+        encoder_layers = get_layers_by_path(model, model_param_names[model_name]['encoder_prefix'])
+        for i, block in enumerate(encoder_layers):
+            parts = model_param_names[model_name]['attn_out'].split('.')
+            for part in parts:
+                block = getattr(block, part)
+            block.register_forward_hook(activation_hook(f'{i}', 'enc'))
+    if has_decoder(model_name):
+        decoder_layers = get_layers_by_path(model, model_param_names[model_name]['decoder_prefix'])
+        for i, block in enumerate(decoder_layers):
+            parts = model_param_names[model_name]['attn_out'].split('.')
+            for part in parts:
+                block = getattr(block, part)
+            block.register_forward_hook(activation_hook(f'{i}', 'dec'))
+
+
 def create_random_batches(model_dim, seq_len, batch_size):
     while True:
         yield torch.randn(batch_size, seq_len, model_dim)
 
-def get_model_specific_dataloader(model_name, tokenizer, batch_size, hf_token=None):
+def get_model_specific_dataloader(model_name, tokenizer, batch_size, hf_token=None, data_dir='data'):
     if model_name == 'gpt2-large':
         return load_wikitext(tokenizer, batch_size)
-    elif model_name == "olmo1b":
-        return load_dolma(tokenizer, batch_size)
+    elif model_name in ("olmo1b", "qwen", "olmo3"):
+        return load_dolma(tokenizer, batch_size, data_dir)
     elif model_name == 'opusmt':
         return prepare_tatoeba_dataloader(tokenizer, batch_size)
     elif model_name == 'vit':
-        token_string = open(hf_token).read().strip()
-        return load_imagenet(tokenizer, token_string, batch_size)
+        return load_imagenet(tokenizer, hf_token, batch_size)
     else:
         raise ValueError(f"Unsupported model name: {model_name}")
 
@@ -339,7 +494,7 @@ def main(args):
     # os.environ['HF_HOME'] = args.hf_cache
 
     dataloader = get_model_specific_dataloader(
-        args.model_name, tokenizer, args.batch_size, args.hf_token
+        args.model_name, tokenizer, args.batch_size, args.hf_token, args.data_dir
     )
 
     # instantiate dict and add hooks
@@ -369,13 +524,15 @@ def main(args):
         device='cpu',
         layer_range=layer_range,
         reference=args.reference,
+        model_name=args.model_name,
     )
 
     # set up structure of activations dict
     activations_dict = get_activations_dict(sides, layer_range, args.reference, n_enc_layers, n_dec_layers)
-
     if args.post_act:
         add_pre_hooks_fc2(model, activations_dict, model_name=args.model_name )
+    elif args.attn_corrs:
+        add_attn_hooks(model, activations_dict, model_name=args.model_name )
     else:
         add_hooks(model, activations_dict, model_name=args.model_name )
     print('added hooks')
@@ -387,30 +544,41 @@ def main(args):
                 # vit is (list of tensors, labels)
                 images, _ = batch
                 _ = model(images.to(device), interpolate_pos_encoding=True)
+                batch_data = None
             elif args.model_name == 'opusmt':
                 # opusmt is dict of tensors
                 batch.to(device)
                 _ = model(attention_mask=batch['attention_mask'], input_ids=batch['input_ids'], labels=batch['labels'])
-            elif args.model_name == 'olmo1b':
+                # Extract length information for padding removal
+                batch_data = {
+                    'src_length': batch['src_length'].cpu().tolist() if 'src_length' in batch else None,
+                    'tgt_length': batch['tgt_length'].cpu().tolist() if 'tgt_length' in batch else None
+                }
+            elif args.model_name in ('olmo1b', 'qwen', 'olmo3'):
                 batch = {k: v.to(device) for k, v in batch.items()}
-                input_ids = batch['input_ids']
-                attention_mask = batch['attention_mask']
-                _ = model(input_ids=input_ids, attention_mask=attention_mask)
+                _ = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+                batch_data = None
             else:
                 # gpt2 is dict of tensors
                 batch.to(device)
                 _ = model(**batch)
+                batch_data = None
 
             # Update the tracker with the collected activations
-            corr_tracker.update(activations_dict)
+            corr_tracker.update(activations_dict, batch_data)
 
             # clear activations_dict after processing batch to free VRAM
             for side in sides:
                 for layer_key in activations_dict[side]:
                     activations_dict[side][layer_key] = None
 
-            if corr_tracker.total_tokens > args.max_toks:
-                break
+
+            if corr_tracker.enc_total_tokens != 0 and corr_tracker.enc_total_tokens > 0:
+                if corr_tracker.enc_total_tokens > args.max_toks:
+                    break
+            elif corr_tracker.enc_total_tokens == 0 and corr_tracker.dec_total_tokens  > 0:
+                if corr_tracker.dec_total_tokens > args.max_toks:
+                    break
     
     corr_tracker.finalize_correlations(
         args.outdir, scaling=args.scaling, post_act=args.post_act
@@ -425,8 +593,10 @@ if __name__ == "__main__":
     parser.add_argument("--reference", type=int, help="Reference layer")
     parser.add_argument("--layer-range", type=str, help="Layer range (e.g., 2-6)")
     parser.add_argument("--hf-cache", type=str)
-    parser.add_argument("--hf-token", type=str)
+    parser.add_argument("--hf-token", type=str, default=os.getenv('HF_TOKEN'))
+    parser.add_argument("--data-dir", type=str, default='data', help='Directory containing prepared datasets')
     parser.add_argument("--scaling", action='store_true')
     parser.add_argument("--post-act", action='store_true', help='Whether to use post-activation reps')
+    parser.add_argument("--attn-corrs", action='store_true', help='Whether to compute attention correlations')
     args = parser.parse_args()
     main(args)
