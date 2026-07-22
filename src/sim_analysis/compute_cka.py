@@ -7,11 +7,13 @@ import numpy as np
 from tqdm import tqdm
 from copy import deepcopy
 from datasets import load_dataset
+import datasets 
 from torch.utils.data import DataLoader
 
 from transformers import ViTImageProcessor, ViTForImageClassification
 from transformers import GPT2Model, GPT2Tokenizer, DataCollatorForLanguageModeling
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import OlmoForCausalLM
 
 from sim_analysis.similarity import CKA
 
@@ -32,7 +34,7 @@ def compute_cka(matrix1, matrix2, max_toks=10000, type='linear'):
     return x
 
 # loop through attn and ff, and get cka for each layer
-def cka_loop(info_dict, args):
+def cka_loop(info_dict, args, partial_saving=False):
     n_layers = len(info_dict['layers'])
     last_layer = n_layers
     sublayers = ['attn', 'ff']
@@ -48,8 +50,14 @@ def cka_loop(info_dict, args):
                     sims[i][j][sublayer] = compute_cka(mat1.numpy(), mat2.numpy(),
                                                        type=args.cka,
                                                        max_toks=args.max_toks)
+                    print(f'{i} {j} computed')
                 elif i == j:
                     sims[i][j][sublayer] = 1.0
+        if partial_saving:
+            print(f'saving partial ckas for layer {i}')
+            with open(os.path.join(args.outdir, f'sims_layer{i}_{args.max_toks}_{args.cka}_updated.json'), 'w+') as f:
+                json.dump(sims[i], f)
+                sims[i] = None
     return sims
 
 # 
@@ -62,6 +70,14 @@ def add_hooks_gpt2(model,tmp_residual_info):
         block.attn.c_proj.register_forward_hook(activation_hook(('attn', i)))
         block.mlp.c_proj.register_forward_hook(activation_hook(('ff', i)))
 
+def add_hooks_olmo(model, tmp_residual_info):
+    def activation_hook(info_tuple):
+        def hook(model, input, output):
+            tmp_residual_info['layers'][int(info_tuple[1])][info_tuple[0]] = output.detach().cpu()
+        return hook
+    for i, block in enumerate(model.model.layers):
+        block.self_attn.o_proj.register_forward_hook(activation_hook(('attn', i)))
+        block.mlp.down_proj.register_forward_hook(activation_hook(('ff', i)))
 
 def add_hooks_vit(model,tmp_residual_info):
     def activation_hook(info_tuple):
@@ -116,8 +132,7 @@ def load_vit(token):
     model_name = 'google/vit-base-patch16-224'
     model = ViTForImageClassification.from_pretrained(model_name)
     image_processor = ViTImageProcessor.from_pretrained(model_name)
-    token_string = open(token).read().strip()
-    dataset = load_dataset('ILSVRC/imagenet-1k', split='validation', streaming=True, token=token_string)
+    dataset = load_dataset('ILSVRC/imagenet-1k', split='validation', streaming=True, token=token)
 
     def collate_fn(batch):
         # Extract images and labels
@@ -134,7 +149,21 @@ def load_vit(token):
     model_layers_pointer = model.vit.encoder.layer
     n_layers = len(model_layers_pointer)
     return model, dataloader, n_layers
+
+
+def load_dolma(tokenizer, batch_size, data_dir='data'):
+    batched_dataset = datasets.load_from_disk(os.path.join(data_dir, 'processed_dolma_2048.hf'))
+    batched_dataset = batched_dataset.select(range(1000))
+
+    def collate_fn(batch):
+        input_ids = torch.tensor([x["input_ids"] for x in batch])
+        attention_mask = torch.tensor([x["attention_mask"] for x in batch])
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
     
+    dataloader = DataLoader(batched_dataset, batch_size=batch_size, collate_fn=collate_fn)
+    return dataloader
+
 
 def load_opusmt():
     model_name = "Helsinki-NLP/opus-mt-zh-en"
@@ -161,11 +190,22 @@ def load_gpt2(model_name):
     n_layers = len(model_layers_pointer)
     return model, dataloader, n_layers
 
+def load_olmo(batch_size, data_dir):
+    model_name = 'allenai/OLMo-1B-0724-hf'
+    model = OlmoForCausalLM.from_pretrained(model_name)
+    model.half()
+
+    dataloader = load_dolma(model_name, batch_size, data_dir)
+    model_layers_pointer = model.model.layers
+    n_layers = len(model_layers_pointer)
+    return model, dataloader, n_layers
+
 
 
 def main(args):
 
-    os.environ['HF_HOME'] = args.hf_cache
+    if args.hf_cache:
+        os.environ['HF_HOME'] = args.hf_cache
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     res_type = args.get_residual_info
@@ -185,6 +225,10 @@ def main(args):
     elif args.model_type == 'opusmt':
         model, dataloader, n_layers = load_opusmt()
         tokenizer = AutoTokenizer.from_pretrained('Helsinki-NLP/opus-mt-zh-en')
+    
+    elif args.model_type == 'olmo':
+        model, dataloader, n_layers = load_olmo(args.batch_size, args.data_dir)
+        tokenizer = None # not needed, dataset pretokenized for time savings
 
     # initialize info_dict
     for i in range(n_layers):
@@ -201,6 +245,8 @@ def main(args):
         add_hooks_gpt2(model, tmp_residual_info) 
     elif args.model_type == 'opusmt':
         add_hooks_opusmt(model, tmp_residual_info)
+    elif args.model_type == 'olmo':
+        add_hooks_olmo(model, tmp_residual_info)
     
     
     model.eval()
@@ -230,6 +276,10 @@ def main(args):
                 batch = {'input_ids': inputs['input_ids'], 'attention_mask': inputs['attention_mask'], 'labels': labels['input_ids']}
                 inputs = {k: v.to(device) for k, v in batch.items()}
                 _ = model(**inputs)
+            elif args.model_type == 'olmo':
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                _ = model(input_ids=input_ids, attention_mask=attention_mask)
 
             for i in range(n_layers):
                 for component in ['attn', 'ff']:
@@ -243,9 +293,10 @@ def main(args):
             if total_toks > args.max_toks:
                 break
     print('computing ckas')
-    sims = cka_loop(residual_info, args)
-    with open(os.path.join(args.outdir, f'sims_{args.max_toks}_{args.cka}_updated.json'), 'w+') as f:
-        json.dump(sims, f)
+    sims = cka_loop(residual_info, args, partial_saving=args.partial_saving)
+    if not args.partial_saving:
+        with open(os.path.join(args.outdir, f'sims_{args.max_toks}_{args.cka}_updated.json'), 'w+') as f:
+            json.dump(sims, f)
     print('done')
 
 
@@ -284,15 +335,28 @@ if __name__ == '__main__':
     parser.add_argument(
         '--cka',
         type=str,
+        default='linear',
         help='rbf or linear'
     )
     parser.add_argument(
         '--hf-token',
         type=str,
+        default=os.getenv('HF_TOKEN'),
     )
     parser.add_argument(
         '--hf-cache',
         type=str,
+    )
+    parser.add_argument(
+        '--data-dir',
+        type=str,
+        default='data',
+        help='Directory containing prepared datasets',
+    )
+    parser.add_argument(
+        '--partial-saving',
+        action='store_true',
+        help='whether to save ckas as they are computed'
     )
     args = parser.parse_args()
     main(args)

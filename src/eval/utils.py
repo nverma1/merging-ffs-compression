@@ -1,4 +1,3 @@
-import os
 import torch
 import numpy as np
 import datasets 
@@ -6,14 +5,13 @@ from datasets import load_dataset
 
 from transformers import ViTForImageClassification, ViTImageProcessor
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
-from transformers import OlmoForCausalLM, AutoModelForCausalLM
+from transformers import OlmoForCausalLM
 from transformers import MarianMTModel, AutoTokenizer
 from torch.utils.data import DataLoader
 
 from transformers import DataCollatorForLanguageModeling
 from transformers import DataCollatorForSeq2Seq
 from functools import partial
-from functools import reduce
 
 
 # this can be updated to accommodate more model types
@@ -21,7 +19,6 @@ model_param_names = {
     'vit':{
         'encoder_prefix': 'vit.encoder.layer',
         'decoder_prefix': None,
-        'attn_out': 'attention.output.dense',
         'fc1': 'intermediate.dense',
         'fc2': 'output.dense',
         'has_bias': True
@@ -29,7 +26,6 @@ model_param_names = {
     'opusmt':{
         'encoder_prefix': 'model.encoder.layers',
         'decoder_prefix': 'model.decoder.layers',
-        'attn_out': 'attn.out_proj',
         'fc1': 'fc1',
         'fc2': 'fc2',
         'has_bias': True
@@ -37,7 +33,6 @@ model_param_names = {
     'gpt2-large':{
         'encoder_prefix': None,
         'decoder_prefix': 'transformer.h',
-        'attn_out': 'attn.out_proj',
         'fc1': 'mlp.c_fc',
         'fc2': 'mlp.c_proj',
         'has_bias': True
@@ -45,7 +40,6 @@ model_param_names = {
     'olmo':{
         'encoder_prefix': None,
         'decoder_prefix': 'model.layers',
-        'attn_out': 'attn.out_proj',
         'fc1': 'mlp.up_proj',
         'fc1_gate': 'mlp.gate_proj',
         'fc2': 'mlp.down_proj',
@@ -54,25 +48,6 @@ model_param_names = {
     'olmo1b':{
         'encoder_prefix': None,
         'decoder_prefix': 'model.layers',
-        'attn_out': 'attn.out_proj',
-        'fc1': 'mlp.up_proj',
-        'fc1_gate': 'mlp.gate_proj',
-        'fc2': 'mlp.down_proj',
-        'has_bias': False
-    },
-    'qwen':{
-        'encoder_prefix': None,
-        'decoder_prefix': 'model.layers',
-        'attn_out': 'self_attn.o_proj',
-        'fc1': 'mlp.up_proj',
-        'fc1_gate': 'mlp.gate_proj',
-        'fc2': 'mlp.down_proj',
-        'has_bias': False
-    },
-    'olmo3':{
-        'encoder_prefix': None,
-        'decoder_prefix': 'model.layers',
-        'attn_out': 'self_attn.o_proj',
         'fc1': 'mlp.up_proj',
         'fc1_gate': 'mlp.gate_proj',
         'fc2': 'mlp.down_proj',
@@ -88,19 +63,14 @@ dim_map = {
     'opusmt':2048,
     'olmo': 11008,
     'olmo1b': 8192,
-    'qwen': 12288,
-    'olmo3': 11008,
-}
-
-emb_map = {
-    'vit': 768, 
-    'gpt2-large': 1280,
-    'opusmt': None, #TODO: check this
-    'olmo': None, #TODO: check this     
-    'olmo1b': None, #TODO: check this
 }
 
 
+'''
+layer manipulation helpers
+'''
+import operator
+from functools import reduce
 
 def get_submodule(model, path):
     """Fetch nested submodule or parameter via dot-separated path."""
@@ -288,39 +258,9 @@ def load_imagenet(image_processor, token_string='', batch_size=8):
     dataloader = DataLoader(imagenet_valid, batch_size=batch_size, collate_fn=collate_fn)
     return dataloader
 
-def process_dolma(tokenizer, batch_size, data_dir='data'):
-    # load streaming dataset. This is only 16.4G
-    dolma_dataset = datasets.load_dataset('allenai/dolma', 'v1_6-sample', split='train', trust_remote_code=True)
-    # apply tokenization 
-    # headers =     features: ['id', 'text', 'added', 'created', 'source'],
-    dolma_dataset = dolma_dataset.remove_columns(['id', 'added', 'created', 'source'])
-    def tokenize_function(examples):
-        return tokenizer(examples['text'], return_special_tokens_mask=True)
-    tokenized_dolma = dolma_dataset.map(tokenize_function, batched=True, remove_columns=['text'], num_proc=4)
-    # group texts into blocks of 2048 tokens
-    batched_dataset = tokenized_dolma.map(group_texts, batched=True, batch_size=100)
-    # finish and save and return
-    dolma_path = os.path.join(data_dir, 'processed_dolma_2048.hf')
-    if not os.path.exists(dolma_path):
-        batched_dataset.save_to_disk(dolma_path)
-    return batched_dataset
+def load_olmomix(tokenizer, batch_size):
+    dataset = load_dataset("allenai/olmo-mix-1124", split)
 
-def load_dolma(tokenizer, batch_size, data_dir='data'):
-    dolma_path = os.path.join(data_dir, 'processed_dolma_2048.hf')
-    if os.path.exists(dolma_path):
-        batched_dataset = datasets.load_from_disk(dolma_path)
-    else:
-        batched_dataset = process_dolma(tokenizer, batch_size, data_dir)
-
-    def collate_fn(batch):
-        input_ids = torch.tensor([x["input_ids"] for x in batch])
-        attention_mask = torch.tensor([x["attention_mask"] for x in batch])
-        return {"input_ids": input_ids, "attention_mask": attention_mask}
-
-    
-    dataloader = DataLoader(batched_dataset, batch_size=batch_size, collate_fn=collate_fn)
-    return dataloader
-    
 # load tatoeba data, loads zh-en direction
 def prepare_tatoeba_dataloader(tokenizer, batch_size, seq_len=None):
     dataset = load_dataset("Helsinki-NLP/tatoeba_mt", "eng-zho", split="validation")
@@ -386,20 +326,8 @@ def load_model(model_type, model_path=None):
         model_name = 'allenai/OLMo-7B-0724-hf'
         model = OlmoForCausalLM.from_pretrained(model_name)
     elif model_type == 'olmo1b':
-        model_name = 'allenai/OLMo-1B-0724-hf'
-        model = AutoModelForCausalLM.from_pretrained(model_name)
-    elif model_type == 'qwen':
-        model_name = 'Qwen/Qwen3-8B'
-        if model_path:
-            model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16)
-        else:
-            model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
-    elif model_type == 'olmo3':
-        model_name = 'allenai/OLMo-3-1025-7B'
-        if model_path:
-            model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16)
-        else:
-            model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
+        model_name = 'allenai/OLMo-2-0425-1B'
+        model = OlmoForCausalLM.from_pretrained(model_name)
     return model
 
 # loads a tokenizer given a model type
@@ -411,6 +339,8 @@ def load_tokenizer(model_type):
     elif model_type == 'gpt2-large':
         model_name = 'gpt2-large'
         tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
     elif model_type == 'opusmt':
         model_name = "Helsinki-NLP/opus-mt-zh-en"
         tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -418,14 +348,6 @@ def load_tokenizer(model_type):
         model_name = 'allenai/OLMo-7B-0724-hf'
         tokenizer = AutoTokenizer.from_pretrained(model_name)
     elif model_type == 'olmo1b':
-        model_name = 'allenai/OLMo-1B-0724-hf'
+        model_name = 'allenai/OLMo-2-0425-1B'
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-    elif model_type == 'qwen':
-        model_name = 'Qwen/Qwen3-8B'
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-    elif model_type == 'olmo3':
-        model_name = 'allenai/OLMo-3-1025-7B'
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
     return tokenizer

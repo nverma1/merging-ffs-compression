@@ -5,8 +5,10 @@ from tqdm import tqdm
 from transformers import (
     GPT2LMHeadModel, 
     GPT2TokenizerFast, 
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
+    Olmo2ForCausalLM
 )
+from utils import load_model
 
 # adapted from  https://huggingface.co/docs/transformers/perplexity
 
@@ -16,7 +18,7 @@ def load_quantized(args):
     if args.baseline:
         model_name = 'gpt2-large'
     else:
-        model_name = args.model
+        model_name = args.model_type
     model = GPT2LMHeadModel.from_pretrained(model_name, quantization_config=quantization_config,
     device_map="auto")
     return model
@@ -34,18 +36,15 @@ def get_layer_list(string_input):
     
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_model(args.model_type, args.model_path)
     if args.quantize:
         model = load_quantized(args)
-    elif args.baseline:
-        model = GPT2LMHeadModel.from_pretrained('gpt2-large')
-    elif args.drop_layers:
-        model = GPT2LMHeadModel.from_pretrained(args.model)
+    
+    if args.drop_layers:
         layer_list = get_layer_list(args.drop_layers)
         model = remove_layers(model, layer_list)
-        state_dict = torch.load(args.model)
-        model.load_state_dict(state_dict)
-    else:
-        model = GPT2LMHeadModel.from_pretrained(args.model)
+        # state_dict = torch.load(args.model)
+        # model.load_state_dict(state_dict)
         
     if not args.quantize:
         model.to(device)
@@ -56,8 +55,8 @@ def main(args):
     test = load_dataset("wikitext", "wikitext-103-raw-v1", split=args.split)
     encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
 
-    # get ppl 
-    max_length = model.config.n_positions
+    # get ppl
+    max_length = model.config.n_positions if hasattr(model.config, 'n_positions') else 1024
     stride = 512
     seq_len = encodings.input_ids.size(1)
     print('seq_len ', seq_len)
@@ -89,7 +88,8 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Compute ppl of GPT2 model')
-    parser.add_argument('--model', type=str, required=False, help='Path to model')
+    parser.add_argument('--model-type', type=str, required=True, default='gpt2', help='Type of model, use this or model')
+    parser.add_argument('--model-path', type=str, required=False, help='Path to model')
     parser.add_argument('--baseline', action='store_true', help='Whether to use the baseline model')
     parser.add_argument('--quantize', action='store_true', help='Whether to quantize the model')
     parser.add_argument('--split', default='validation', type=str, help='Dataset split to evaluate on')

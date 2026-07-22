@@ -1,0 +1,28 @@
+# Ignore all dotfiles
+.*
+
+# Except .gitignore
+!.gitignore
+
+# Ignore wandb directory
+wandb/
+
+# Ignore Python cache files and directories
+__pycache__/
+*.py[cod]
+
+# Ignore other common Python-related files
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+*.log
+*.sqlite3
+.DS_Store
+*whl
+qlog*
+*csv
+*.txt
+
+# ...but keep requirements files (requirements.txt, requirements-olmo3.txt)
+!requirements*.txt

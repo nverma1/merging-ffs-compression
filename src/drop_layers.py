@@ -24,7 +24,7 @@ def main(args):
     new_param_count = sum(p.numel() for p in model.parameters())
     print(f'ratio: {new_param_count/orig_param_count}')
     
-    torch.save(model.state_dict(), args.output)
+    model.save_pretrained(args.output, safe_serialization=False)
 
 
 
