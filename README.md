@@ -160,3 +160,20 @@ python plot_cka.py --file $output_dir/sims_10000_linear_updated.json --component
 
 #### AI Assistance
 This code was developed with the assistance of OpenAI's ChatGPT, as well as Copilot.
+
+### Citation
+
+If you found this work or code helpful, please cite:
+
+```bibtex
+@article{
+verma2026merging,
+title={Merging Feed-Forward Sublayers for Compressed Transformers},
+author={Neha Verma and Kenton Murray and Kevin Duh},
+journal={Transactions on Machine Learning Research},
+issn={2835-8856},
+year={2026},
+url={https://openreview.net/forum?id=t8iuiH46g0},
+note={}
+}
+```
